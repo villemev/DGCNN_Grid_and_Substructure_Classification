@@ -9,9 +9,6 @@ from torch.nn.utils.rnn import pad_sequence
 from scipy.optimize import linear_sum_assignment
 import hashlib
 
-
-# Environment setup
-
 # DGCNN utilities and fallback implementations
 def _median_nn_distance(points: np.ndarray) -> float:
     if len(points) < 2:
@@ -52,9 +49,6 @@ def load_multistructure_points_from_json(json_path):
             })
     return pd.DataFrame(rows)
 
-## Data loading and preprocessing
-
-# Group points by structure for substructure classification
 def group_by_structure_substructure(df):
     """Group points by structure and prepare for substructure classification"""
     grouped = []
@@ -63,9 +57,6 @@ def group_by_structure_substructure(df):
         y_sub = group['substructure_id'].values
         grouped.append((torch.tensor(X), torch.tensor(y_sub, dtype=torch.long), struct_id))
     return grouped
-
-
-
 class StructureSetDatasetSubstructure(Dataset):
     def __init__(self, grouped):
         self.grouped = grouped
@@ -84,7 +75,6 @@ def collate_fn_substructure(batch):
     mask = torch.arange(Xs_padded.shape[1])[None, :] < torch.tensor(lens)[:, None]
     return Xs_padded, y_subs_padded, mask, struct_ids
 
-# Shared MLP building block for encoder modules
 class MLP(nn.Module):
     def __init__(self, channels, use_groupnorm: bool = True):
         super().__init__()
@@ -101,7 +91,6 @@ class MLP(nn.Module):
     def forward(self, x):
         return self.net(x)
 
-# Helper: Masked kNN computation with adaptive k and proper padding
 def masked_knn_idx_safe(feat, mask, k):
     """
     Compute masked kNN indices with adaptive k handling.
@@ -201,56 +190,74 @@ def local_frame_directional_idx_knn_topm(
     idx_dir = torch.cat([fwd, back, left, right], dim=2)          # [B,N,4*m]
     return idx_dir
 
-
 class DirectionalEdgeConvBlock(nn.Module):
-    """Directional EdgeConv over k_dir = 4*m_per_dir neighbors selected from kNN candidates."""
-
+    """
+    Directional EdgeConv over k_dir = 4*m_per_dir neighbors selected from kNN candidates.
+    """
     def __init__(self, in_channels, out_channels, k_base=12, m_per_dir=2, use_groupnorm=True):
         super().__init__()
         self.k_base = k_base
         self.m_per_dir = m_per_dir
-        self.k_dir = 4 * m_per_dir
+        self.k_dir = 4 * m_per_dir  # 8 when m_per_dir=2
         self.mlp = MLP([in_channels * 2, out_channels, out_channels], use_groupnorm=use_groupnorm)
 
     def forward(self, x, mask, geom_xy):
-        B, N, _ = x.shape
+        B, N, C = x.shape
         device = x.device
 
         idx = local_frame_directional_idx_knn_topm(
             geom_xy, mask, k_base=self.k_base, m_per_dir=self.m_per_dir
-        )
+        )  # [B,N,k_dir]
 
         batch_idx = torch.arange(B, device=device)[:, None, None]
-        x_neighbors = x[batch_idx, idx, :]
-        x_center = x.unsqueeze(2).expand(-1, -1, self.k_dir, -1)
+        x_neighbors = x[batch_idx, idx, :]                           # [B,N,k_dir,C]
+        x_center = x.unsqueeze(2).expand(-1, -1, self.k_dir, -1)      # [B,N,k_dir,C]
 
-        edge_feat = torch.cat([x_neighbors - x_center, x_center], dim=-1)
+        edge_feat = torch.cat([x_neighbors - x_center, x_center], dim=-1)  # [B,N,k_dir,2C]
         edge_flat = edge_feat.reshape(B * N * self.k_dir, -1)
         out_flat = self.mlp(edge_flat)
         out = out_flat.reshape(B, N, self.k_dir, -1).max(dim=2).values
 
         return out * mask.unsqueeze(-1).float()
 
-
 class EdgeConvBlock(nn.Module):
-    """EdgeConv block that recomputes kNN graph from current features."""
-
     def __init__(self, in_channels, out_channels, k=8, use_groupnorm=True):
         super().__init__()
         self.k = k
+        
+        # MLP with GroupNorm for stability
         self.mlp = MLP([in_channels * 2, out_channels, out_channels], use_groupnorm=use_groupnorm)
 
     def forward(self, x, mask):
-        B, N, _ = x.shape
-        idx = masked_knn_idx_safe(x, mask, self.k)
+        """
+        Args:
+            x: [B, N, C] feature tensor
+            mask: [B, N] boolean mask
+        
+        Returns:
+            out: [B, N, out_channels] with masked points zeroed
+        """
+        B, N, C = x.shape
+        
+        idx = masked_knn_idx_safe(x, mask, self.k)       # [B, N, k]
+        
+        # Gather neighbor features
         batch_idx = torch.arange(B, device=x.device)[:, None, None]
-        x_neighbors = x[batch_idx, idx, :]
-        x_center = x.unsqueeze(2).expand(-1, -1, self.k, -1)
-        edge_feat = torch.cat([x_neighbors - x_center, x_center], dim=-1)
-        edge_flat = edge_feat.reshape(B * N * self.k, -1)
-        out_flat = self.mlp(edge_flat)
-        out = out_flat.reshape(B, N, self.k, -1).max(dim=2).values
+        x_neighbors = x[batch_idx, idx, :]               # [B, N, k, C]
+        x_center = x.unsqueeze(2).expand(-1, -1, self.k, -1)  # [B, N, k, C]
+        
+        # Edge features: [relative, center]
+        edge_feat = torch.cat([x_neighbors - x_center, x_center], dim=-1)  # [B, N, k, 2C]
+        
+        # Apply MLP and max pooling over neighbors
+        B, N, k, _ = edge_feat.shape
+        edge_flat = edge_feat.reshape(B * N * k, -1)     # [B*N*k, 2C]
+        out_flat = self.mlp(edge_flat)                   # [B*N*k, out_channels]
+        out = out_flat.reshape(B, N, k, -1)              # [B, N, k, out_channels]
+        out = out.max(dim=2).values                      # [B, N, out_channels]
+        
         out = out * mask.unsqueeze(-1).float()
+        
         return out
 
 class DGCNNSubstructure(nn.Module):
@@ -298,15 +305,6 @@ class DGCNNSubstructure(nn.Module):
         B, N, C = feat.shape
         sub_logits = self.substructure_head(feat.reshape(B * N, C)).reshape(B, N, self.n_substructures)
         return sub_logits
-
-
-## DGCNN for substructure classification with hungarian alignment
-
-# Hungarian Alignment Helper Functions for Substructure Classification
-# 
-# Since ground-truth substructure IDs are local per structure (any permutation is valid),
-# we must align predicted class channels to GT IDs per structure before computing loss.
-# This ensures the model learns groupings, not arbitrary numeric labels.
 
 def _build_negative_iou_cost(pred_labels_np: np.ndarray,
                              gt_labels_np: np.ndarray,
@@ -400,25 +398,6 @@ def align_logits_with_hungarian(logits_b: torch.Tensor,
     y_valid = y_b[valid]                         # [Nv]
     
     return x_aligned, y_valid
-
-## Training
-
-# Set random seeds for reproducibility
-def set_seed(seed=42):
-    """Set all random seeds for reproducible training runs"""
-    import random
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)
-        # Make CUDA operations deterministic (may slow down training slightly)
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
-
-# Data versioning: Check if training data has changed
-
 def get_data_hash(df, n_substructures):
     """Generate a hash of the training data to detect changes (includes class count)"""
     # Create a string representation sensitive to data AND class structure changes

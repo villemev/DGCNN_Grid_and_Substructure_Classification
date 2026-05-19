@@ -1,10 +1,12 @@
-# Environment check: Pure PyTorch DGCNN (no external dependencies)
 import os
 import random
 import sys
+import time
+from pathlib import Path
 
 import hashlib
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
 from sklearn.model_selection import train_test_split
@@ -20,21 +22,44 @@ from DGCNN_classification_UV_scripts import (
     normalize_scene,
 )
 
-# Set random seeds for reproducibility
+# ===========================
+# User-editable parameters
+# ===========================
 SEED = 42
+JSON_PATH = 'JSON/UV.json'
+N_EPOCHS = 20
+
+MODELS_OUTPUT_DIR = 'trained_models'
+MODEL_FILENAME = 'UV.pth'
+
+RESULTS_OUTPUT_DIR = 'results'
+RESULTS_CSV_FILENAME = 'Model_comparison.csv'
+
+TRAIN_TEST_SPLIT = 0.2
+BATCH_SIZE = 8
+REPRODUCIBLE = True
+
+# Set random seeds for reproducibility
+if REPRODUCIBLE:
+    os.environ['PYTHONHASHSEED'] = str(SEED)
+    os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':16:8'
+else:
+    os.environ.pop('CUBLAS_WORKSPACE_CONFIG', None)
 random.seed(SEED)
 np.random.seed(SEED)
 torch.manual_seed(SEED)
 torch.cuda.manual_seed(SEED)
 torch.cuda.manual_seed_all(SEED)  # for multi-GPU
-torch.backends.cudnn.deterministic = True
-torch.backends.cudnn.benchmark = False
+torch.backends.cudnn.deterministic = REPRODUCIBLE
+torch.backends.cudnn.benchmark = not REPRODUCIBLE
+torch.use_deterministic_algorithms(REPRODUCIBLE, warn_only=True)
 
 print(f"Python: {sys.version.split()[0]}")
 print(f"PyTorch: {torch.__version__} (CUDA available: {torch.cuda.is_available()})")
 print(f"NumPy: {np.__version__}")
 print("Using pure PyTorch DGCNN implementation (no PyG or torch_cluster dependencies).")
 print(f"Random seed locked to {SEED} for reproducibility")
+print(f"Reproducible mode: {REPRODUCIBLE}")
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"Device: {device}")
@@ -44,15 +69,15 @@ script_dir = os.path.dirname(os.path.abspath(__file__))
 os.chdir(script_dir)
 print(f"Working directory set to {os.getcwd()}")
 
-df = load_points_from_json('JSON/UV.json')
+json_path = Path(JSON_PATH)
+df = load_points_from_json(json_path)
 
 # Model save directory
-models_dir = 'trained_models'
-if not os.path.exists(models_dir):
-    os.makedirs(models_dir)
+models_dir = Path(MODELS_OUTPUT_DIR)
+models_dir.mkdir(parents=True, exist_ok=True)
 
-model_path = os.path.join(models_dir, 'UV.pth')
-n_epochs = 10  # Set number of epochs for training
+model_path = models_dir / MODEL_FILENAME
+n_epochs = N_EPOCHS
 
 # Shift labels so -1 becomes 0, and grid points become 1 to n
 # This allows the model to predict outliers (class 0)
@@ -69,7 +94,11 @@ print("Class 0 represents outliers; remaining classes map to grid points")
 
 # --- Structure-based split ---
 unique_structures = df['structure'].unique()
-train_structs, test_structs = train_test_split(unique_structures, test_size=0.2, random_state=42)
+train_structs, test_structs = train_test_split(
+    unique_structures,
+    test_size=TRAIN_TEST_SPLIT,
+    random_state=SEED,
+)
 train_df = df[df['structure'].isin(train_structs)].reset_index(drop=True)
 test_df = df[df['structure'].isin(test_structs)].reset_index(drop=True)
 
@@ -89,17 +118,20 @@ for struct_df in [train_df, test_df]:
         struct_df.loc[mask, 'x_norm'] = pts_norm[:, 0]
         struct_df.loc[mask, 'y_norm'] = pts_norm[:, 1]
 
-#Structure-wise input with padding
-
 train_structs_grouped = group_by_structure_separate(train_df)
 test_structs_grouped = group_by_structure_separate(test_df)
 
 train_set = StructureSetDatasetSeparate(train_structs_grouped)
 test_set = StructureSetDatasetSeparate(test_structs_grouped)
-train_loader = DataLoader(train_set, batch_size=8, shuffle=True, collate_fn=collate_fn_separate)
-test_loader = DataLoader(test_set, batch_size=8, collate_fn=collate_fn_separate)
+if REPRODUCIBLE:
+    _g = torch.Generator()
+    _g.manual_seed(SEED)
+    train_loader = DataLoader(train_set, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn_separate, generator=_g)
+else:
+    train_loader = DataLoader(train_set, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn_separate)
+test_loader = DataLoader(test_set, batch_size=BATCH_SIZE, collate_fn=collate_fn_separate)
 
-##Training architecture with multi head attention
+start_time = time.time()
 
 # Training loop for DGCNN with separate u/v classification and uniqueness loss
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -131,45 +163,13 @@ val_v_accuracies = []
 val_combined_accuracies = []
 
 if os.path.exists(model_path):
-    print(f"Found saved model at '{model_path}'")
-    checkpoint = torch.load(model_path, map_location=device, weights_only=False)
-    saved_data_hash = checkpoint.get('data_hash', 'unknown')
-    saved_n_u = checkpoint.get('n_u', 'unknown')
-    saved_n_v = checkpoint.get('n_v', 'unknown')
-
-    data_changed = saved_data_hash != current_data_hash
-    classes_changed = (saved_n_u != n_u) or (saved_n_v != n_v)
-
-    if data_changed:
-        print("Training data changed since the last checkpoint; retraining from scratch.")
-    if classes_changed:
-        print(
-            f"Class configuration changed (saved u/v={saved_n_u}/{saved_n_v}, current={n_u}/{n_v}); "
-            "retraining with updated heads."
-        )
-
-    if not data_changed and not classes_changed:
-        model.load_state_dict(checkpoint['model_state_dict'])
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-
-        train_losses = checkpoint.get('train_losses', [])
-        val_losses = checkpoint.get('val_losses', [])
-        val_u_accuracies = checkpoint.get('val_u_accuracies', [])
-        val_v_accuracies = checkpoint.get('val_v_accuracies', [])
-        val_combined_accuracies = checkpoint.get('val_combined_accuracies', [])
-
-        best_acc = max(val_combined_accuracies) if val_combined_accuracies else float('nan')
-        final_acc = val_combined_accuracies[-1] if val_combined_accuracies else float('nan')
-        print(
-            f"Checkpoint matches current configuration; reusing weights. "
-            f"Best combined accuracy {best_acc:.4f}, last accuracy {final_acc:.4f}."
-        )
-        n_epochs = 0
-    else:
-        print("Existing checkpoint is incompatible; starting a new training run.")
+    print(
+        f"Found saved model at '{model_path}', but retraining is forced; "
+        "starting a new training run from scratch."
+    )
 else:
     print(f"No saved model found at '{model_path}'. A new training run will be started.")
+
 
 # Training loop
 for epoch in range(n_epochs):
@@ -280,7 +280,7 @@ if n_epochs > 0:
             'weight_decay': 1e-4,
             'architecture': 'adaptive_knn_attention_uniqueness'
         }
-    }, model_path)
+    }, str(model_path))
 
     best_acc = max(val_combined_accuracies) if val_combined_accuracies else float('nan')
     final_acc = val_combined_accuracies[-1] if val_combined_accuracies else float('nan')
@@ -290,3 +290,44 @@ if n_epochs > 0:
     print(f"Model supports {n_u} u-classes and {n_v} v-classes")
 
 print("Training routine completed.")
+
+elapsed_time = time.time() - start_time
+
+max_u = int(df['u'].max())
+max_v = int(df['v'].max())
+max_grid_size = max(max_u + 1, max_v + 1)
+
+final_u_acc = val_u_accuracies[-1] if val_u_accuracies else None
+final_v_acc = val_v_accuracies[-1] if val_v_accuracies else None
+final_combined_acc = val_combined_accuracies[-1] if val_combined_accuracies else None
+
+result_row = pd.DataFrame([
+    {
+        'file_name': json_path.name,
+        'json_path': str(json_path),
+        'seed': SEED,
+        'max_u': max_u,
+        'max_v': max_v,
+        'max_grid_size': max_grid_size,
+        'n_points': len(df),
+        'n_structures': df['structure'].nunique(),
+        'epochs': n_epochs,
+        'u_accuracy': final_u_acc,
+        'v_accuracy': final_v_acc,
+        'combined_accuracy': final_combined_acc,
+        'elapsed_seconds': elapsed_time,
+        'model_path': str(model_path),
+    }
+])
+
+results_dir = Path(RESULTS_OUTPUT_DIR)
+results_dir.mkdir(parents=True, exist_ok=True)
+
+results_csv = results_dir / RESULTS_CSV_FILENAME
+
+write_header = not results_csv.exists()
+result_row.to_csv(results_csv, mode='a', header=write_header, index=False)
+
+print("Training routine completed.")
+print(f"Result written to: {results_csv}")
+print(result_row.to_string(index=False))

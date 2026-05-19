@@ -4,8 +4,11 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, DataLoader
+from sklearn.model_selection import train_test_split
 from torch.nn.utils.rnn import pad_sequence
+from scipy.optimize import linear_sum_assignment
+import hashlib
 
 # DGCNN utilities and fallback implementations
 def _median_nn_distance(points: np.ndarray) -> float:
@@ -24,7 +27,6 @@ def normalize_scene(points: np.ndarray) -> np.ndarray:
     scale = _median_nn_distance(p)
     return p / scale
 
-# Load data from JSON file
 def load_points_from_json(json_path):
     with open(json_path, 'r') as f:
         data = json.load(f)
@@ -45,7 +47,6 @@ def load_points_from_json(json_path):
             })
     return pd.DataFrame(rows)
 
-# Group points by structure for separate u/v classification
 def group_by_structure_separate(df):
     grouped = []
     for struct_id, group in df.groupby('structure'):
@@ -83,8 +84,6 @@ def collate_fn_separate(batch):
     y_vs_padded = pad_sequence(y_vs, batch_first=True, padding_value=-1)  # [B, max_n_points]
     mask = torch.arange(Xs_padded.shape[1])[None, :] < torch.tensor(lens)[:, None]
     return Xs_padded, y_us_padded, y_vs_padded, mask, struct_ids, struct_types
-
-# Shared building blocks for the DGCNN encoder
 
 class MLP(nn.Module):
     def __init__(self, channels, use_groupnorm: bool = True):
@@ -354,6 +353,8 @@ class DGCNNSeparateUV(nn.Module):
         return u_logits, v_logits
 
 
+# CONSTRAINT-AWARE LOSS: Penalize duplicate (u,v) predictions during training
+
 class UniquenessLoss(nn.Module):
     """
     Loss component that penalizes duplicate (u,v) predictions within a structure.
@@ -429,5 +430,81 @@ class UniquenessLoss(nn.Module):
         avg_penalty = total_penalty / B
         
         return self.weight * avg_penalty
+
+
+# Alternative: SOFT Uniqueness Loss using probabilities (differentiable)
+class SoftUniquenessLoss(nn.Module):
+    """
+    Differentiable version: penalizes high probability of duplicate (u,v) pairs.
+    
+    ONLY penalizes duplicate GRID POINTS (u>0, v>0).
+    Allows multiple points with:
+    - Same u-axis alignment (u>0, v=0)
+    - Same v-axis alignment (u=0, v>0)
+    - Same outlier status (u=0, v=0)
+    
+    Uses softmax probabilities instead of hard predictions for better gradients.
+    """
+    def __init__(self, weight=0.05):
+        super().__init__()
+        self.weight = weight
+    
+    def forward(self, u_logits, v_logits, mask):
+        """
+        Computes expected number of duplicate GRID POINT pairs based on probability distributions.
+        """
+        B, N, n_u = u_logits.shape
+        n_v = v_logits.shape[-1]
+        
+        # Get probability distributions
+        u_probs = torch.softmax(u_logits, dim=-1)  # [B, N, n_u]
+        v_probs = torch.softmax(v_logits, dim=-1)  # [B, N, n_v]
+        
+        total_loss = 0.0
+        
+        for b in range(B):
+            valid_mask = mask[b]
+            n_valid = valid_mask.sum().item()
+            
+            if n_valid <= 1:
+                continue
+            
+            # Get valid probabilities
+            u_p = u_probs[b, valid_mask]  # [n_valid, n_u]
+            v_p = v_probs[b, valid_mask]  # [n_valid, n_v]
+            
+            # Calculate probability that each point is a grid point (u>0 and v>0)
+            # P(grid point) = P(u>0) * P(v>0) = (1 - P(u=0)) * (1 - P(v=0))
+            p_u_nonzero = 1.0 - u_p[:, 0]  # [n_valid]
+            p_v_nonzero = 1.0 - v_p[:, 0]  # [n_valid]
+            p_grid_point = p_u_nonzero * p_v_nonzero  # [n_valid]
+            
+            # For grid points only (u>0, v>0), compute pairwise overlap
+            # Exclude class 0 from the overlap calculation
+            u_p_grid = u_p[:, 1:]  # [n_valid, n_u-1] - only grid u values
+            v_p_grid = v_p[:, 1:]  # [n_valid, n_v-1] - only grid v values
+            
+            # P(same_u | both are grid points) for u>0
+            u_overlap = u_p_grid @ u_p_grid.T  # [n_valid, n_valid]
+            v_overlap = v_p_grid @ v_p_grid.T  # [n_valid, n_valid]
+            
+            # P(same_u AND same_v | both are grid points)
+            same_uv_prob_given_grid = u_overlap * v_overlap  # [n_valid, n_valid]
+            
+            # Weight by probability that BOTH points are grid points
+            p_both_grid = p_grid_point.unsqueeze(0) * p_grid_point.unsqueeze(1)  # [n_valid, n_valid]
+            
+            # Expected duplicate probability
+            duplicate_prob = same_uv_prob_given_grid * p_both_grid  # [n_valid, n_valid]
+            
+            # Remove diagonal and sum (expected number of duplicate pairs)
+            duplicate_prob = duplicate_prob * (1 - torch.eye(n_valid, device=u_logits.device))
+            expected_duplicates = duplicate_prob.sum() / 2.0  # Divide by 2 (each pair counted twice)
+            
+            total_loss += expected_duplicates
+        
+        avg_loss = total_loss / B
+        return self.weight * avg_loss
+
 
 
