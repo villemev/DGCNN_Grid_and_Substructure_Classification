@@ -36,6 +36,15 @@ The predicted abstractions (substructures + grid indices) are intended to act as
 - `DGCNN_classification_structure_runner.py`  
   Training / evaluation runner for the substructure model
 
+- `Training_sett_scripts.py`  
+  Synthetic structure generators (orthogonal, skewed, curved, fan-shaped layouts)
+
+- `Substructure_scripts.py`  
+  Multi-substructure generation utilities
+
+- `Data_cleaning_scripts.py`  
+  Dataset cleaning and preprocessing utilities
+
 - `JSON/`  
   Example JSON files illustrating the expected **training input format**  
   (synthetic point sets, labels, masks, and metadata used by the generators)
